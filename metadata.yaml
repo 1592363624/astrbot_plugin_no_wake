@@ -1,0 +1,6 @@
+name: astrbot_plugin_no_wake
+display_name: 免唤醒词插件
+description: 允许机器人不需要唤醒词即可触发指令，支持动态开关
+version: 1.0.0
+author: Shell
+repo: https://github.com/1592363624/astrbot_plugin_no_wake

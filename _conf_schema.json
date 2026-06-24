@@ -1,0 +1,7 @@
+{
+    "enabled": {
+        "description": "启用免唤醒词功能",
+        "type": "bool",
+        "default": true
+    }
+}
