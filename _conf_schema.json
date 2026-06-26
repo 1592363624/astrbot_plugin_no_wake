@@ -3,5 +3,15 @@
         "description": "启用免唤醒词功能",
         "type": "bool",
         "default": true
+    },
+    "auto_patch": {
+        "description": "启用自动补丁（AstrBot 更新后自动修补 stage.py）",
+        "type": "bool",
+        "default": true
+    },
+    "notify_admin": {
+        "description": "启用管理员通知（补丁结果发送给管理员）",
+        "type": "bool",
+        "default": true
     }
 }
