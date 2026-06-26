@@ -13,5 +13,10 @@
         "description": "启用管理员通知（补丁结果发送给管理员）",
         "type": "bool",
         "default": true
+    },
+    "auto_restart": {
+        "description": "补丁成功后自动重启 AstrBot（需要配置 Dashboard）",
+        "type": "bool",
+        "default": false
     }
 }

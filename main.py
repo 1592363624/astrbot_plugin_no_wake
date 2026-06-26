@@ -3,10 +3,16 @@
 允许机器人不需要唤醒词即可触发指令，支持动态开关。
 插件加载时自动检测并修补 AstrBot 核心的 stage.py 文件，
 确保 "*" 唤醒词逻辑在 AstrBot 更新后仍然生效。
+支持补丁成功后自动重启 AstrBot 使补丁生效。
 """
 
 import asyncio
+import datetime
 import os
+import time
+
+import aiohttp
+import jwt
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -85,24 +91,48 @@ class NoWakePlugin(Star):
         self.auto_patch = getattr(config, "auto_patch", True)
         # 是否启用管理员通知
         self.notify_admin = getattr(config, "notify_admin", True)
+        # 是否启用补丁后自动重启
+        self.auto_restart = getattr(config, "auto_restart", False)
 
         # 延迟通知机制：记录补丁结果，等待管理员交互时发送通知
         self._patch_notification: str | None = None
         self._need_notify: bool = False
 
+        # Dashboard API 配置
+        self._dashboard_session: aiohttp.ClientSession | None = None
+
+        # 重启缓存：用于记录重启状态，重启后检测
+        self._restart_cache: dict = config.get("restart_cache", {})
+
         logger.info(
             f"免唤醒词插件已加载 - 启用: {self.enabled}, "
             f"仅私聊: {self.private_only}, 仅群聊: {self.group_only}, "
-            f"自动补丁: {self.auto_patch}, 管理员通知: {self.notify_admin}"
+            f"自动补丁: {self.auto_patch}, 管理员通知: {self.notify_admin}, "
+            f"自动重启: {self.auto_restart}"
         )
 
+        # 检测是否是重启后启动，如果是则发送重启完成通知
+        if self.notify_admin:
+            self._check_restart_completion()
+
         # 插件加载时自动检测并修补 stage.py
+        patch_applied = False
         if self.auto_patch:
-            self._apply_stage_patch()
+            patch_applied = self._apply_stage_patch()
 
         # 如果有补丁结果需要通知管理员，使用异步任务发送
         if self._need_notify and self.notify_admin and self._patch_notification:
             asyncio.create_task(self._send_admin_notification(self._patch_notification))
+
+        # 如果补丁成功且启用了自动重启，延迟重启 AstrBot
+        if patch_applied and self.auto_restart:
+            logger.info("检测到补丁已应用且启用了自动重启，将在3秒后重启 AstrBot...")
+            asyncio.create_task(self._delayed_restart())
+
+    async def terminate(self):
+        """插件卸载时清理资源"""
+        if self._dashboard_session and not self._dashboard_session.closed:
+            await self._dashboard_session.close()
 
     @filter.command("免唤醒", alias={"nowake", "nowakeword"})
     async def toggle_nowake(self, event: AstrMessageEvent, action: str = "status"):
@@ -185,6 +215,41 @@ class NoWakePlugin(Star):
             "• 免唤醒 group - 仅群聊启用\n"
             "• 免唤醒 all - 所有场景启用"
         )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("重启框架")
+    async def restart_framework(self, event: AstrMessageEvent):
+        """
+        重启 AstrBot 框架（仅管理员可用）
+        重启前后会在当前会话发送通知
+        """
+        # 检查是否为管理员
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 仅管理员可执行重启操作")
+            return
+
+        # 发送重启前通知到当前会话
+        yield event.plain_result("🔄 正在重启 ...\n请稍候，重启完成后会通知您。")
+
+        # 记录重启状态和通知位置
+        self._restart_cache["restarting"] = True
+        self._restart_cache["start_ts"] = time.time()
+        self._restart_cache["notify_umo"] = event.unified_msg_origin
+        self._restart_cache["notify_platform_id"] = event.get_platform_id()
+        self.config["restart_cache"] = self._restart_cache
+        self.config.save_config()
+
+        # 延迟1秒后执行重启
+        await asyncio.sleep(1)
+        try:
+            await self._restart_astrbot()
+        except Exception as e:
+            logger.error(f"重启失败: {e}")
+            yield event.plain_result(f"❌ 重启失败: {e}")
+            # 清除重启状态
+            self._restart_cache["restarting"] = False
+            self.config["restart_cache"] = self._restart_cache
+            self.config.save_config()
 
     def _get_status_message(self) -> str:
         """获取当前状态信息"""
@@ -441,3 +506,147 @@ class NoWakePlugin(Star):
             return sender_id in admin_ids
         except Exception:
             return False
+
+    async def _delayed_restart(self) -> None:
+        """
+        延迟重启 AstrBot（给通知发送留出时间）。
+        重启前发送通知给管理员，重启后也会发送完成通知。
+        通过 Dashboard HTTP API 调用重启接口。
+        """
+        try:
+            # 延迟3秒，确保之前的补丁通知消息已发送
+            await asyncio.sleep(3)
+
+            # 发送重启前通知给管理员
+            await self._send_admin_notification("🔄 正在重启 ...\n补丁已应用，重启后将生效。")
+
+            # 记录重启状态到缓存，用于重启后检测
+            self._restart_cache["restarting"] = True
+            self._restart_cache["start_ts"] = time.time()
+            self.config["restart_cache"] = self._restart_cache
+            self.config.save_config()
+
+            # 延迟1秒确保通知已发送，然后执行重启
+            await asyncio.sleep(1)
+
+            logger.info("正在重启 ...")
+            await self._restart_astrbot()
+
+        except Exception as e:
+            logger.error(f"自动重启  失败: {e}")
+            # 重启失败时清除缓存
+            self._restart_cache["restarting"] = False
+            self.config["restart_cache"] = self._restart_cache
+            self.config.save_config()
+
+    def _check_restart_completion(self) -> None:
+        """
+        检测是否是重启后启动。
+        如果缓存中记录了重启状态，则发送重启完成通知到原来的位置。
+        """
+        try:
+            if not self._restart_cache.get("restarting"):
+                return
+
+            # 获取重启开始时间
+            start_ts = self._restart_cache.get("start_ts", 0)
+            elapsed = time.time() - start_ts if start_ts else 0
+
+            # 获取通知位置
+            notify_umo = self._restart_cache.get("notify_umo")
+            notify_platform_id = self._restart_cache.get("notify_platform_id")
+
+            # 清除重启状态
+            self._restart_cache["restarting"] = False
+            self._restart_cache["start_ts"] = 0
+            self._restart_cache["notify_umo"] = ""
+            self._restart_cache["notify_platform_id"] = ""
+            self.config["restart_cache"] = self._restart_cache
+            self.config.save_config()
+
+            # 异步发送重启完成通知到原来的位置
+            msg = f"✅ 重启完成！\n耗时 {elapsed:.1f} 秒，补丁已生效。"
+            if notify_umo:
+                asyncio.create_task(self._send_message_to_umo(notify_umo, msg))
+                logger.info(f"检测到重启完成，已发送通知到: {notify_umo}")
+            else:
+                # 如果没有记录位置，发送给管理员
+                asyncio.create_task(self._send_admin_notification(msg))
+                logger.info("检测到重启完成，已发送通知给管理员")
+
+        except Exception as e:
+            logger.error(f"检测重启完成状态失败: {e}")
+
+    async def _send_message_to_umo(self, umo: str, message: str) -> None:
+        """
+        发送消息到指定的 unified_msg_origin 位置。
+        :param umo: unified_msg_origin 格式的会话标识
+        :param message: 要发送的消息内容
+        """
+        try:
+            message_chain = MessageChain().message(message)
+            await self.context.send_message(umo, message_chain)
+            logger.info(f"已发送消息到: {umo}")
+        except Exception as e:
+            logger.error(f"发送消息失败 ({umo}): {e}")
+            # 如果发送失败，尝试发送给管理员作为备选
+            await self._send_admin_notification(message)
+
+    async def _restart_astrbot(self) -> None:
+        """
+        通过 Dashboard API 重启 AstrBot 核心。
+        参考 astrbot_plugin_restart 的实现方式。
+        """
+        try:
+            # 获取 Dashboard 配置
+            config = self.context.get_config()
+            dashboard_config = config.get("dashboard", {})
+            host = dashboard_config.get("host", "127.0.0.1")
+            port = int(os.environ.get("DASHBOARD_PORT") or dashboard_config.get("port", 6185))
+
+            # 如果 host 是 0.0.0.0，替换为 127.0.0.1
+            if host == "0.0.0.0":
+                host = "127.0.0.1"
+
+            # 构建重启 API 地址
+            restart_url = f"http://{host}:{port}/api/stat/restart-core"
+
+            # 生成 JWT 令牌
+            token = self._generate_dashboard_jwt(dashboard_config)
+
+            # 创建 HTTP 会话并发送重启请求
+            if not self._dashboard_session or self._dashboard_session.closed:
+                self._dashboard_session = aiohttp.ClientSession()
+
+            headers = {"Authorization": f"Bearer {token}"}
+            async with self._dashboard_session.post(restart_url, headers=headers) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"重启请求失败 [{resp.status}]: {await resp.text()}")
+                body = await resp.json()
+                if body.get("status") != "ok":
+                    raise RuntimeError(f"重启失败: {body.get('message') or body.get('msg')}")
+                logger.info("AstrBot 重启请求已发送")
+
+        except Exception as e:
+            logger.error(f"调用 Dashboard API 重启失败: {e}")
+            raise
+
+    def _generate_dashboard_jwt(self, dashboard_config: dict) -> str:
+        """
+        为 Dashboard API 请求生成 JWT 令牌。
+        :param dashboard_config: Dashboard 配置字典
+        :return: JWT 令牌字符串
+        """
+        username = dashboard_config.get("username")
+        jwt_secret = dashboard_config.get("jwt_secret")
+
+        if not username or not jwt_secret:
+            raise RuntimeError("Dashboard 用户名或 jwt_secret 未配置，无法生成鉴权令牌")
+
+        payload = {
+            "username": username,
+            "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=7),
+        }
+        token = jwt.encode(payload, jwt_secret, algorithm="HS256")
+        logger.debug("已为重启请求生成本地 Dashboard JWT")
+        return token
